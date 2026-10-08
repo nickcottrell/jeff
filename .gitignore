@@ -11,3 +11,4 @@ __pycache__/
 # reference repo. Copy the committed *.example.json to these filenames to configure a clone.
 volumes.json
 .jeff-volumes-active.json
+make-roots.json

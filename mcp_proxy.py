@@ -657,6 +657,69 @@ def toolchain_list():
 
 
 @mcp.tool()
+def make_list():
+    """List the live Figma Make design slots Jeff can see -- each registered project's
+    make-integration/registry.json, aggregated through the make-roots pointer. Returns per
+    slot: name, port, URL, title, live up/down, and its pages (each a mock, with a thumbnail
+    path). Jeff only holds pointers; the designs live in their own project dirs.
+    """
+    added = JEFF_DIR not in sys.path
+    if added:
+        sys.path.insert(0, JEFF_DIR)
+    try:
+        import make as _make
+        return json.dumps({"slots": _make.aggregate()}, indent=2, default=str)
+    except Exception as exc:
+        return json.dumps({"error": "make_list error: %s" % exc})
+    finally:
+        if added and JEFF_DIR in sys.path:
+            sys.path.remove(JEFF_DIR)
+
+
+@mcp.tool()
+def make_open(slot: str, page: str = "/"):
+    """Resolve a Make slot + page to its live local URL (to drill into that mock) and its
+    thumbnail path.
+
+    Args:
+        slot: A slot name from make_list (e.g. "ticketflow").
+        page: A page path (e.g. "/learn-more") or its label; defaults to the home page "/".
+    """
+    added = JEFF_DIR not in sys.path
+    if added:
+        sys.path.insert(0, JEFF_DIR)
+    try:
+        import make as _make
+        for s in _make.aggregate():
+            if s["slot"] != slot:
+                continue
+            want = page.strip().lower()
+            match = None
+            for p in s["pages"]:
+                if want in ("", "/") and p["path"] == "/":
+                    match = p
+                    break
+                if p["path"].lower() == want or (p["label"] or "").lower() == want:
+                    match = p
+                    break
+            if match is None:
+                match = s["pages"][0] if s["pages"] else None
+            if match is None:
+                return json.dumps({"error": "slot '%s' has no pages" % slot})
+            return json.dumps({
+                "slot": slot, "page": match["label"], "path": match["path"],
+                "url": s["url"].rstrip("/") + match["path"],
+                "live": s["live"], "thumb": match["thumb"],
+            }, default=str)
+        return json.dumps({"error": "no such slot: %s" % slot})
+    except Exception as exc:
+        return json.dumps({"error": "make_open error: %s" % exc})
+    finally:
+        if added and JEFF_DIR in sys.path:
+            sys.path.remove(JEFF_DIR)
+
+
+@mcp.tool()
 def chip_search(query: str, top_k: int = 5):
     """Search the chip's knowledge base.
 
