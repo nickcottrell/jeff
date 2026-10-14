@@ -6,46 +6,78 @@ them, tracks their status, and exposes them through its panel and APIs. The
 reasoning inside a toolchain (e.g. C2D2's triage + shelf) stays with the
 toolchain; Jeff is the doorway, not the room.
 
-A toolchain declares itself with a `toolchain.json` manifest under tools/<x>/.
-This mirrors how Jeff registers engines from mounted cards (engine_sync /
-engine_list): drop a manifest, Jeff surfaces it.
+The list is the live MCP network, not a hand-kept roster. The source of truth
+is .mcp.json -- every MCP peer Jeff sits beside is a toolchain, discovered and
+probed the same way mcp-doctor connects to it (initialize + tools/list over a
+real JSON-RPC handshake). Add a server to the network and it shows up here; no
+second file to maintain. Jeff itself is the doorway, so it is left off its own
+list.
+
+A server may ship a toolchain.json beside its script (e.g.
+core/c2d2/toolchain.json next to core/c2d2/server.py). That manifest enriches
+the row -- title, tier, triage command, capabilities -- but it is optional.
+Peers without one still appear, as a bare live line.
 
 Usage:
     toolchains.py            human-readable registry (for the Jeff panel)
     toolchains.py --json     machine-readable (for Jeff's APIs / surfaces)
+    toolchains.py --no-probe skip the live handshake (manifest fields only)
+    toolchains.py --compact  one line per toolchain, never probes
 """
 
+import importlib.util
 import json
 import os
 import re
-import subprocess
 import sys
 
 _JEFF_DIR = os.path.dirname(os.path.abspath(__file__))
-_MAESTRO_ROOT = os.path.dirname(os.path.dirname(_JEFF_DIR))
-_TOOLS_DIR = os.path.join(_MAESTRO_ROOT, "tools")
+_CORE_DIR = os.path.dirname(_JEFF_DIR)
+_MAESTRO_ROOT = os.path.dirname(_CORE_DIR)
+_MCP_CONFIG = os.path.join(_MAESTRO_ROOT, ".mcp.json")
 
 
-def _load_manifests():
-    """Discover toolchain.json manifests under tools/<x>/."""
-    found = []
-    if not os.path.isdir(_TOOLS_DIR):
-        return found
-    for name in sorted(os.listdir(_TOOLS_DIR)):
-        path = os.path.join(_TOOLS_DIR, name, "toolchain.json")
-        if os.path.isfile(path):
-            try:
-                with open(path) as f:
-                    tc = json.load(f)
-                tc["_manifest"] = os.path.relpath(path, _MAESTRO_ROOT)
-                found.append(tc)
-            except Exception as exc:
-                found.append({"name": name, "error": "bad manifest: %s" % exc})
-    return found
+def _read_network():
+    """The live MCP network: .mcp.json peers, minus Jeff (the doorway)."""
+    try:
+        with open(_MCP_CONFIG) as f:
+            servers = json.load(f).get("mcpServers", {})
+    except Exception:
+        return []
+    out = []
+    for name, cfg in servers.items():
+        args = cfg.get("args", [])
+        script = args[0] if args else ""
+        if name == "jeff" or script.endswith("mcp_proxy.py"):
+            continue  # Jeff is the doorway, not an item in its own list.
+        out.append({
+            "server": name,
+            "type": cfg.get("type", "stdio"),
+            "command": cfg.get("command", ""),
+            "args": args,
+            "script": script,
+        })
+    return out
 
 
-def _tool_count(tc):
-    """Count the tools a toolchain exposes, from its declared tools_manifest."""
+def _find_manifest(script):
+    """A toolchain.json beside the server's script enriches its row (optional)."""
+    if not script:
+        return None
+    path = os.path.join(_MAESTRO_ROOT, os.path.dirname(script), "toolchain.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            tc = json.load(f)
+        tc["_manifest"] = os.path.relpath(path, _MAESTRO_ROOT)
+        return tc
+    except Exception as exc:
+        return {"error": "bad manifest: %s" % exc}
+
+
+def _tool_count_from_manifest(tc):
+    """Fallback tool count from a declared tools_manifest, when not probing live."""
     rel = tc.get("tools_manifest")
     if not rel:
         return None
@@ -59,62 +91,73 @@ def _tool_count(tc):
         return None
 
 
-def _probe_status(tc):
-    """Run the toolchain's declared status_probe. rc == 0 means up."""
-    probe = tc.get("status_probe")
-    if not probe or not probe.get("command"):
-        return "unknown"
-    cmd = [probe["command"]] + probe.get("args", [])
-    try:
-        r = subprocess.run(cmd, cwd=_MAESTRO_ROOT, capture_output=True,
-                           text=True, timeout=8)
-        return "up" if r.returncode == 0 else "down"
-    except Exception:
-        return "down"
+_doctor = None
+
+
+def _handshake(command, args):
+    """Reuse mcp-doctor's proven initialize + tools/list probe (one copy, shared)."""
+    global _doctor
+    if _doctor is None:
+        path = os.path.join(_CORE_DIR, "mcp-doctor.py")
+        spec = importlib.util.spec_from_file_location("mcp_doctor", path)
+        _doctor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_doctor)
+    return _doctor.handshake(command, args)
 
 
 def summary(probe=True):
-    """The registry: one dict per registered toolchain, with live status."""
+    """The registry: one dict per live toolchain, with manifest enrichment."""
     out = []
-    for tc in _load_manifests():
-        if tc.get("error"):
-            out.append({"name": tc.get("name", "?"), "error": tc["error"]})
+    for srv in _read_network():
+        man = _find_manifest(srv["script"]) or {}
+        if man.get("error"):
+            out.append({"name": srv["server"], "server": srv["server"],
+                        "error": man["error"]})
             continue
-        ep = tc.get("endpoint", {})
-        tri = tc.get("triage") or {}
+        tri = man.get("triage") or {}
         triage_cmd = ([tri["command"]] + tri.get("args", [])) if tri.get("command") else None
+        status, tools = "unprobed", None
+        if probe:
+            h = _handshake(srv["command"], srv["args"])
+            status = "up" if h.get("ok") else "down"
+            tools = h.get("tools")
+        if tools is None:
+            tools = _tool_count_from_manifest(man)
+        ep = man.get("endpoint", {}) or {}
         out.append({
-            "name": tc.get("name", "?"),
-            "title": tc.get("title", ""),
-            "kind": tc.get("kind", ""),
-            "tier": tc.get("tier", ""),
-            "summary": tc.get("summary", ""),
-            "tools": _tool_count(tc),
-            "capabilities": tc.get("capabilities", []),
-            "triage": bool(tc.get("triage")),
+            "name": man.get("name", srv["server"]),
+            "server": srv["server"],
+            "title": man.get("title", ""),
+            "kind": man.get("kind", ""),
+            "tier": man.get("tier", ""),
+            "summary": man.get("summary", ""),
+            "tools": tools,
+            "capabilities": man.get("capabilities", []),
+            "triage": bool(man.get("triage")),
             "triage_cmd": triage_cmd,
             "endpoint": ("%s %s %s" % (
-                ep.get("type", "?"), ep.get("command", ""),
-                " ".join(ep.get("args", [])))).strip(),
-            "status": _probe_status(tc) if probe else "unprobed",
-            "manifest": tc.get("_manifest", ""),
+                ep.get("type", srv["type"]), srv["command"],
+                " ".join(srv["args"]))).strip(),
+            "status": status,
+            "manifest": man.get("_manifest", ""),
         })
     return out
 
 
 def _print_human(rows):
     if not rows:
-        print("No toolchains registered with Jeff.")
+        print("No toolchains on the network.")
         return
-    dot = {"up": "●", "down": "○", "unknown": "◌"}
-    print("Toolchains registered with Jeff: %d\n" % len(rows))
+    dot = {"up": "●", "down": "○", "unknown": "◌", "unprobed": "●"}
+    print("Toolchains on the network: %d\n" % len(rows))
     for r in rows:
         if r.get("error"):
             print("  ○ %s — %s" % (r["name"], r["error"]))
             continue
+        label = r["title"] or r["server"]
         tags = ", ".join(t for t in (r.get("tier"), r.get("kind")) if t)
-        print("  %s %s — %s  [%s]" % (
-            dot.get(r["status"], "◌"), r["name"], r["title"], tags))
+        head = "  %s %s — %s" % (dot.get(r["status"], "◌"), r["name"], label)
+        print(head + ("  [%s]" % tags if tags else ""))
         bits = ["status: %s" % r["status"]]
         if r.get("tools") is not None:
             bits.append("%d tools" % r["tools"])
@@ -129,7 +172,7 @@ def _print_human(rows):
 def _print_compact(rows):
     """One line per toolchain -- for the always-visible panel header."""
     if not rows:
-        print("  (none registered)")
+        print("  (none on the network)")
         return
     dot = {"up": "●", "down": "○", "unknown": "◌", "unprobed": "●"}
     for r in rows:
