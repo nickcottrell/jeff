@@ -499,6 +499,109 @@ def chip_registry():
 
 
 # ============================================================
+# CAAS BRIDGE (the snap-together: a live call returns a SEALED packet)
+# ============================================================
+
+_DEVKIT_SRC = os.path.expanduser("~/Repositories/maestro-dev-kit/src")
+_KEEPALIVE_FILE = os.path.expanduser("~/maestro/.claude/state/keepalive")
+
+
+def _keepalive_on():
+    """Is the owner present? Reuses Jeff's keepalive mirror file. Fail-closed."""
+    try:
+        with open(_KEEPALIVE_FILE) as f:
+            return f.read().strip() == "ON"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _cue_bridge():
+    """Import the cue sealer + bridge (dev-kit). Guarded upstream so a missing
+    dev-kit becomes a clear tool error, not an import crash."""
+    if _DEVKIT_SRC not in sys.path:
+        sys.path.insert(0, _DEVKIT_SRC)
+    from cue import jeff_bridge, seal  # noqa: F401
+    return jeff_bridge, seal
+
+
+_BROKER = os.environ.get("CUE_BROKER", "http://127.0.0.1:8000").rstrip("/")
+
+
+def _broker_seal(payload, title, kind="cloud", payload_id="cloud"):
+    """Ask the broker (the one signing authority) to seal a payload with the
+    PRESENCE-held card keeper. Jeff holds no signing key: it builds the cloud, the
+    broker signs it only while the owner is present (card + passphrase unlocked).
+    Returns (svg, keeper_hex) when sealed, or (None, None) if the broker is down or
+    minting is off."""
+    import urllib.request
+    body = json.dumps({"payload": payload, "title": title, "kind": kind,
+                       "payload_id": payload_id}).encode()
+    req = urllib.request.Request(_BROKER + "/api/seal", data=body,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+            return d.get("svg"), d.get("keeper")
+    except Exception:  # noqa: BLE001  -- 403 (owner absent), broker down, etc.
+        return None, None
+
+
+@mcp.tool()
+def vault_mint_cloud(vault: str, query: str = "", limit: int = 12):
+    """Mint a SEALED caas cloud from a slice of a vault -- the snap-together.
+
+    A normal tool call returns raw JSON you have to trust the connection for. This
+    returns a durable, self-verifying PACKET: a sealed SVG carrying its own payload
+    plus an Ed25519 keeper signature. Any node verifies it alone, offline -- trust
+    the keeper, not the wire. It renders in the caas view.html and shows a Valid pill
+    under a trusted keeper.
+
+    Signing is PRESENCE-gated: keepalive ON -> sealed; OFF -> the unsealed carrier
+    (it renders, no pill). The hive can think without the owner, but cannot mint
+    durable trusted memory behind their back. The client 'hot' vault is refused
+    (working-directory boundary).
+
+    Args:
+        vault: Vault name (e.g. "cold"). "hot" is refused.
+        query: Optional search string; empty = a broad slice.
+        limit: Max entries to pull (default 12).
+    """
+    if vault == "hot":
+        return json.dumps({"error": "refused: 'hot' is the client vault (boundary)"})
+    try:
+        jeff_bridge, _seal = _cue_bridge()
+    except Exception as e:  # noqa: BLE001
+        return json.dumps({"error": "cue bridge unavailable: %s" % e})
+    v = _find_vault(vault)
+    if not v:
+        return json.dumps({"error": "vault '%s' not active" % vault})
+    pattern = "%%%s%%" % (query or "")
+    rows, err = _vault_db_query(v,
+        "SELECT DISTINCT slug FROM vault_images WHERE slug LIKE ? ORDER BY slug LIMIT ?",
+        (pattern, int(limit)))
+    if err:
+        return json.dumps({"error": err})
+    slugs = [r["slug"] for r in rows if r.get("slug")]
+    if not slugs:
+        return json.dumps({"error": "no entries for vault=%s query=%r" % (vault, query)})
+    title = "%s vault slice" % vault
+    cloud = jeff_bridge.cloud_from_entries(
+        slugs, vault=vault, cloud_id="%s-%s" % (vault, query or "all"),
+        title=title, intent="seed a conversation about this slice of the substrate")
+    # Jeff builds the cloud; the broker's PRESENCE-held card keeper signs it. The
+    # key lives on the card, in the broker's memory while unlocked -- never here.
+    sealed, keeper = _broker_seal(cloud, title)
+    if sealed:
+        return json.dumps({"minted": True, "vault": vault, "cards": len(cloud["cards"]),
+                           "bytes": len(sealed), "keeper": keeper,
+                           "via": "broker card keeper (present)", "svg": sealed})
+    unsealed = _seal.build(cloud, title=title, kind="cloud", payload_id="cloud")
+    return json.dumps({"minted": False, "vault": vault, "cards": len(cloud["cards"]),
+                       "bytes": len(unsealed), "svg": unsealed,
+                       "reason": "broker unreachable or owner absent: unsealed carrier, no pill"})
+
+
+# ============================================================
 # MODEL INFERENCE (delegates to chip)
 # ============================================================
 
@@ -555,7 +658,10 @@ def engine_run(model_ref: str, prompt: str, system: str = "", max_tokens: int = 
     sys.path.insert(0, cue_lib)
     try:
         import model_host
-        receipt = model_host.run(model_ref, prompt, system=system, max_tokens=max_tokens)
+        # Provenance-gated runs are receipts: pin greedy so the same
+        # (model, prompt, max_tokens) always yields the same bytes.
+        receipt = model_host.run(model_ref, prompt, system=system, max_tokens=max_tokens,
+                                 temperature=0.0, seed=0)
         return json.dumps(receipt, indent=2)
     except Exception as exc:
         return json.dumps({"ok": False, "text": None, "reason": "engine_run error: %s" % exc})
